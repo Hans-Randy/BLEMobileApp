@@ -116,7 +116,7 @@ export class BuddhaBleClient {
 
   async scanAndConnect(opts?: { namePrefix?: string; timeoutMs?: number }) {
     const timeout = opts?.timeoutMs ?? 15_000;
-    const namePrefix = opts?.namePrefix ?? 'BUDD'; // adjust to your advertised name
+    const namePrefix = opts?.namePrefix ?? 'BUDDHA'; // adjust to your advertised name
 
     return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
