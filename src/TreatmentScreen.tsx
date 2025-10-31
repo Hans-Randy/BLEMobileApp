@@ -100,15 +100,13 @@ export const TreatmentScreen: React.FC = () => {
       if (!clientRef.current || !deviceStatus.connected) return;
 
       try {
-        const [status, battery, info] = await Promise.all([
-          clientRef.current.readStatus(),
+        const [battery, info] = await Promise.all([
           clientRef.current.readBattery(),
           clientRef.current.readDeviceInfo(),
         ]);
 
         setDeviceStatus((prev) => ({
           ...prev,
-          treatmentStatus: status,
           batteryLevel: battery.level,
           chargerConnected: battery.chargerConnected,
           deviceInfo: info,

@@ -169,8 +169,10 @@ export class BuddhaBleClient {
   // --- Device Info ---------------------------------------------------------
   async readDeviceInfo() {
     const dev = this.requireDev();
-    const hw = await dev.readCharacteristicForService(S_DEVICE_INFO, C_HW_VER);
-    const fw = await dev.readCharacteristicForService(S_DEVICE_INFO, C_FW_VER);
+    const [hw, fw] = await Promise.all([
+      dev.readCharacteristicForService(S_DEVICE_INFO, C_HW_VER),
+      dev.readCharacteristicForService(S_DEVICE_INFO, C_FW_VER),
+    ]);
     const hwWord = readU16(hw);
     const fwWord = readU16(fw);
     // eslint-disable-next-line no-bitwise
@@ -187,6 +189,7 @@ export class BuddhaBleClient {
   // --- Battery -------------------------------------------------------------
   async readBattery() {
     const dev = this.requireDev();
+
     const level = readU8(await dev.readCharacteristicForService(S_BATTERY, C_BATT_LEVEL));
     const avgI = readI16(await dev.readCharacteristicForService(S_BATTERY, C_BATT_AVG_I));
     const chg = readU8(await dev.readCharacteristicForService(S_BATTERY, C_BATT_STATUS));
@@ -214,16 +217,6 @@ export class BuddhaBleClient {
   }
 
   // --- Treatment Control ---------------------------------------------------
-  async readStatus() {
-    const dev = this.requireDev();
-    const status = readU8(await dev.readCharacteristicForService(S_TCTRL, C_STATUS)) as 0 | 1 | 2 | 3;
-    const err = readU16(await dev.readCharacteristicForService(S_TCTRL, C_ERROR));
-    const rem = readU16(await dev.readCharacteristicForService(S_TCTRL, C_REMAIN_MS));
-    const inten = readU8(await dev.readCharacteristicForService(S_TCTRL, C_INTENSITY));
-    const total = readU16(await dev.readCharacteristicForService(S_TCTRL, C_TOTAL_MS));
-    return { status, errorCode: err, remainingSec: rem, intensityPct: inten, totalDurationSec: total };
-  }
-
   async writeControl(action: 0 | 1 | 2) {
     const dev = this.requireDev();
     await dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_CTRL, writeU8(action));
@@ -237,6 +230,32 @@ export class BuddhaBleClient {
   async writeIntensity(percent: number) {
     const dev = this.requireDev();
     await dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_INTENSITY, writeU8(percent));
+  }
+
+  async writeDurationMsAndIntensity(ms: number, pct: number) {
+    if (!Number.isInteger(ms) || ms < 0 || ms > 0xFFFF) throw new Error('ms 0–65535');
+    if (!Number.isInteger(pct) || pct < 0 || pct > 100) throw new Error('intensity 0–100');
+    const dev = this.requireDev();
+    await Promise.all([
+        dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_TOTAL_MS, writeU16(ms)),
+        dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_INTENSITY, writeU8(pct)),
+    ]);
+  }
+  
+  async writeLraEnables(flags: Partial<{ lra1: 0|1; lra2: 0|1; lra3: 0|1 }>) {
+    const dev = this.requireDev();
+    const valid = (v: number) => (v === 0 || v === 1) ? v : (() => { throw new Error('LRA flag must be 0 or 1'); })();    
+    const ops: Promise<any>[] = [];
+    if (flags.lra1 != null) ops.push(dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_LRA1_EN, writeU8(valid(flags.lra1))));
+    if (flags.lra2 != null) ops.push(dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_LRA2_EN, writeU8(valid(flags.lra2))));
+    if (flags.lra3 != null) ops.push(dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_LRA3_EN, writeU8(valid(flags.lra3))));
+    if (ops.length) await Promise.all(ops);
+  }
+
+  async writeSteps(steps: Step[]) {
+    const dev = this.requireDev();
+    const payload = packStepsToB64(steps);
+    await dev.writeCharacteristicWithoutResponseForService(S_TCFG, C_STEP_LIST, payload);
   }
 
   subscribeStatus(cb: (status: 0 | 1 | 2 | 3) => void) {
@@ -261,24 +280,16 @@ export class BuddhaBleClient {
 
   async readLraEnables() {
     const dev = this.requireDev();
-    const lra1 = readU8(await dev.readCharacteristicForService(S_TCTRL, C_LRA1_EN)) as 0 | 1;
-    const lra2 = readU8(await dev.readCharacteristicForService(S_TCTRL, C_LRA2_EN)) as 0 | 1;
-    const lra3 = readU8(await dev.readCharacteristicForService(S_TCTRL, C_LRA3_EN)) as 0 | 1;
-    return { lra1, lra2, lra3 };
-  }
-
-  async writeLraEnables(flags: Partial<{ lra1: 0 | 1; lra2: 0 | 1; lra3: 0 | 1 }>) {
-    const dev = this.requireDev();
-    const valid = (v: number) => {
-      if (v !== 0 && v !== 1) throw new Error('LRA flag must be 0 or 1');
-      return v;
+    const [lra1, lra2, lra3] = await Promise.all([
+        dev.readCharacteristicForService(S_TCTRL, C_LRA1_EN),
+        dev.readCharacteristicForService(S_TCTRL, C_LRA2_EN),
+        dev.readCharacteristicForService(S_TCTRL, C_LRA3_EN),
+    ]);
+    return {
+      lra1: readU8(lra1) as 0 | 1,
+      lra2: readU8(lra2) as 0 | 1,
+      lra3: readU8(lra3) as 0 | 1,
     };
-    if (flags.lra1 != null)
-      await dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_LRA1_EN, writeU8(valid(flags.lra1)));
-    if (flags.lra2 != null)
-      await dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_LRA2_EN, writeU8(valid(flags.lra2)));
-    if (flags.lra3 != null)
-      await dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_LRA3_EN, writeU8(valid(flags.lra3)));
   }
 
   async readSteps() {
@@ -287,12 +298,35 @@ export class BuddhaBleClient {
     const steps = unpackStepsFromB64(ch.value);
     return { steps };
   }
-
-  async writeSteps(steps: Step[]) {
+    
+  async readTreatment() {
     const dev = this.requireDev();
-    const payload = packStepsToB64(steps);
-    await dev.writeCharacteristicWithoutResponseForService(S_TCFG, C_STEP_LIST, payload);
-  }
+    const [ctrlC, totalC, remC, intenC, statusC, errC, lra1C, lra2C, lra3C, stepsC] = await Promise.all([
+        dev.readCharacteristicForService(S_TCTRL, C_CTRL),
+        dev.readCharacteristicForService(S_TCTRL, C_TOTAL_MS),
+        dev.readCharacteristicForService(S_TCTRL, C_REMAIN_MS),
+        dev.readCharacteristicForService(S_TCTRL, C_INTENSITY),
+        dev.readCharacteristicForService(S_TCTRL, C_STATUS),
+        dev.readCharacteristicForService(S_TCTRL, C_ERROR),
+        dev.readCharacteristicForService(S_TCTRL, C_LRA1_EN),
+        dev.readCharacteristicForService(S_TCTRL, C_LRA2_EN),
+        dev.readCharacteristicForService(S_TCTRL, C_LRA3_EN),
+        dev.readCharacteristicForService(S_TCFG, C_STEP_LIST)
+    ]);
+
+    return {
+        control: readU8(ctrlC),
+        totalDurationMs: readU16(totalC),
+        remainingMs: readU16(remC),
+        intensityPct: readU8(intenC),
+        status: readU8(statusC) as 0|1|2|3,
+        errorCode: readU16(errC),
+        lra1: readU8(lra1C) as 0 | 1,
+        lra2: readU8(lra2C) as 0 | 1,
+        lra3: readU8(lra3C) as 0 | 1,
+        steps: unpackStepsFromB64(stepsC.value),
+    };
+ }
 }
 
 export type Step = {
