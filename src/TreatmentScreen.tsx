@@ -129,6 +129,9 @@ export const TreatmentScreen: React.FC = () => {
   const handleScanAndConnect = async () => {
     setLoading(true);
     try {
+      // Request permissions first
+      await clientRef.current!.requestPermissions();
+
       await clientRef.current!.scanAndConnect({
         timeoutMs: 10000,
       });

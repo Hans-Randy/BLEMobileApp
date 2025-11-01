@@ -1,5 +1,5 @@
 import { BleManager, Device, Characteristic } from 'react-native-ble-plx';
-import { Platform } from 'react-native';
+import { Platform, PermissionsAndroid } from 'react-native';
 
 // ---- UUIDs (BUDDHA Rev F) -------------------------------------------
 // Services
@@ -113,6 +113,22 @@ const unpackStepsFromB64 = (b64: string | null | undefined): Step[] => {
 export class BuddhaBleClient {
   private manager = new BleManager();
   private device: Device | null = null;
+
+  async requestPermissions() {
+    if (Platform.OS !== 'android') {
+      return;
+    }
+
+    try {
+      await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+      ]);
+    } catch (error) {
+      console.error('Permission request error:', error);
+    }
+  }
 
   async scanAndConnect(opts?: { namePrefix?: string; timeoutMs?: number }) {
     const timeout = opts?.timeoutMs ?? 15_000;
@@ -271,6 +287,23 @@ export class BuddhaBleClient {
       if (!err && c?.value) cb(readU16(c));
     }).remove;
   }
+
+  subscribeTreatmentNotifies(cb: {
+  onStatus?: (s: 0|1|2|3) => void,
+  onRemainingMs?: (ms: number) => void,
+}) {
+  const dev = this.requireDev();
+  const subs = [
+    dev.monitorCharacteristicForService(S_TCTRL, C_STATUS, (err, c) => {
+      if (!err && c?.value && cb.onStatus) cb.onStatus(readU8(c) as 0|1|2|3);
+    }),
+    dev.monitorCharacteristicForService(S_TCTRL, C_REMAIN_MS, (err, c) => {
+      if (!err && c?.value && cb.onRemainingMs) cb.onRemainingMs(readU16(c));
+    }),
+  ];
+  return () => subs.forEach(s => s.remove());
+}
+
 
   async readRemainingTimeMs(): Promise<number> {
     const dev = this.requireDev();
