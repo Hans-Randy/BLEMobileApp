@@ -129,8 +129,9 @@ export const TreatmentScreen: React.FC = () => {
   const handleScanAndConnect = async () => {
     setLoading(true);
     try {
-      // Request permissions first
-      await clientRef.current!.requestPermissions();
+      // Wait for Bluetooth to be ready and scan/connect
+      // (Permission checking is now done inside scanAndConnect)
+      //await clientRef.current!.waitForBluetoothPoweredOn(5000);
 
       await clientRef.current!.scanAndConnect({
         timeoutMs: 10000,

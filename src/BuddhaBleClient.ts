@@ -1,5 +1,7 @@
 import { BleManager, Device, Characteristic } from 'react-native-ble-plx';
-import { Platform, PermissionsAndroid } from 'react-native';
+import { Platform } from 'react-native';
+import { request, PERMISSIONS, RESULTS, check, requestMultiple, checkMultiple } from 'react-native-permissions';
+import { Buffer } from 'buffer';
 
 // ---- UUIDs (BUDDHA Rev F) -------------------------------------------
 // Services
@@ -114,27 +116,110 @@ export class BuddhaBleClient {
   private manager = new BleManager();
   private device: Device | null = null;
 
-  async requestPermissions() {
-    if (Platform.OS !== 'android') {
-      return;
-    }
+  constructor() {
+    // Set up BLE manager error handler
+    this.manager.onStateChange((state) => {
+      console.log('Bluetooth state changed:', state);
+    }, true);
+  }
 
-    try {
-      await PermissionsAndroid.requestMultiple([
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      ]);
-    } catch (error) {
-      console.error('Permission request error:', error);
+  /**
+   * Check if all required permissions are granted
+   */
+ async requestPermissions(): Promise<boolean> {
+  if (Platform.OS === 'android') {
+    const permissions =
+      Platform.Version >= 31
+        ? [
+            PERMISSIONS.ANDROID.BLUETOOTH_SCAN,
+            PERMISSIONS.ANDROID.BLUETOOTH_CONNECT,
+            PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION,
+          ]
+        : [PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION];
+
+    const statuses = await requestMultiple(permissions);
+    return permissions.every(p => statuses[p] === RESULTS.GRANTED);
+  } else if (Platform.OS === 'ios') {
+    const statuses = await requestMultiple([
+      PERMISSIONS.IOS.BLUETOOTH,
+      PERMISSIONS.IOS.LOCATION_WHEN_IN_USE,
+    ]);
+    return Object.values(statuses).every(status => status === RESULTS.GRANTED);
+  }
+  return true;
+}
+
+ async checkPermissions(): Promise<boolean> {
+  if (Platform.OS === 'android') {
+    const permissions =
+      Platform.Version >= 31
+        ? [
+            PERMISSIONS.ANDROID.BLUETOOTH_SCAN,
+            PERMISSIONS.ANDROID.BLUETOOTH_CONNECT,
+            PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION,
+          ]
+        : [PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION];
+
+    const statuses = await checkMultiple(permissions);
+    return permissions.every(p => statuses[p] === RESULTS.GRANTED);
+  } else if (Platform.OS === 'ios') {
+    const statuses = await checkMultiple([
+      PERMISSIONS.IOS.BLUETOOTH,
+      PERMISSIONS.IOS.LOCATION_WHEN_IN_USE,
+    ]);
+    return Object.values(statuses).every(status => status === RESULTS.GRANTED);
+  }
+  return true;
+}
+
+  /**
+   * Wait for Bluetooth to be powered on
+   * @param timeoutMs Maximum time to wait (default: 5000ms)
+   */
+  async waitForBluetoothPoweredOn(timeoutMs: number = 5000): Promise<void> {
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < timeoutMs) {
+      const state = await this.manager.state();
+      if (state === 'PoweredOn') {
+        return;
+      }
+      // Wait a bit before checking again
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
+    
+    const state = await this.manager.state();
+    throw new Error(`Bluetooth is not ready. Current state: ${state}. Please enable Bluetooth and try again.`);
   }
 
   async scanAndConnect(opts?: { namePrefix?: string; timeoutMs?: number }) {
     const timeout = opts?.timeoutMs ?? 15_000;
-    const namePrefix = opts?.namePrefix ?? 'BUDDHA'; // adjust to your advertised name
+    const namePrefix = opts?.namePrefix ?? 'buddha'; // adjust to your advertised name
 
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<void>(async (resolve, reject) => {
+      const hasPermissions = await this.checkPermissions();
+      if (!hasPermissions) {
+        const granted = await this.requestPermissions();
+        if (!granted) {
+          reject(
+            new Error(
+              'Required permissions not granted. Please enable location and Bluetooth permissions.',
+            ),
+          );
+          return;
+        }
+      }
+
+          // Check Bluetooth state before scanning
+    const state = await this.manager.state();
+    if (state !== 'PoweredOn') {
+      reject(
+        new Error(`Bluetooth is not ready. Current state: ${state}. Please enable Bluetooth and try again.`),
+      );
+      return;
+    }
+
+
       const timer = setTimeout(() => {
         this.manager.stopDeviceScan();
         reject(new Error('Scan timeout'));
@@ -147,7 +232,7 @@ export class BuddhaBleClient {
           reject(error);
           return;
         }
-        if (device?.name?.startsWith(namePrefix)) {
+        if (device?.name?.toLowerCase().startsWith(namePrefix)) {
           try {
             this.manager.stopDeviceScan();
             const d = await device.connect();
