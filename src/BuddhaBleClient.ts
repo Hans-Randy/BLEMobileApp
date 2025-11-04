@@ -355,7 +355,9 @@ export class BuddhaBleClient {
 
   async writeSteps(steps: Step[]) {
     const dev = this.requireDev();
+    console.log('Writing steps:', steps);
     const payload = packStepsToB64(steps);
+    console.log('Steps payload:', payload);
     await dev.writeCharacteristicWithoutResponseForService(S_TCFG, C_STEP_LIST, payload);
   }
 

@@ -24,9 +24,9 @@ interface DeviceStatus {
   treatmentStatus?: {
     status: 0 | 1 | 2 | 3;
     errorCode: number;
-    remainingSec: number;
+    remainingMs: number;
     intensityPct: number;
-    totalDurationSec: number;
+    totalDurationMs: number;
   };
 }
 
@@ -56,7 +56,7 @@ export const TreatmentScreen: React.FC = () => {
 
     const client = clientRef.current;
     let unsubscribeBattery: (() => void) | null = null;
-    let unsubscribeStatus: (() => void) | null = null;
+    let unsubscribeTreatment: (() => void) | null = null;
 
     const setupSubscriptions = async () => {
       try {
@@ -68,14 +68,24 @@ export const TreatmentScreen: React.FC = () => {
           }));
         });
 
-        // Set up status subscription
-        unsubscribeStatus = client.subscribeStatus((status: 0 | 1 | 2 | 3) => {
-          setDeviceStatus((prev) => ({
-            ...prev,
-            treatmentStatus: prev.treatmentStatus
-              ? { ...prev.treatmentStatus, status }
-              : undefined,
-          }));
+        // Set up treatment status subscription
+        unsubscribeTreatment = client.subscribeTreatmentNotifies({
+          onStatus: (status: 0 | 1 | 2 | 3) => {
+            setDeviceStatus((prev) => ({
+              ...prev,
+              treatmentStatus: prev.treatmentStatus
+                ? { ...prev.treatmentStatus, status }
+                : undefined,
+            }));
+          },
+          onRemainingMs: (remainingMs: number) => {
+            setDeviceStatus((prev) => ({
+              ...prev,
+              treatmentStatus: prev.treatmentStatus
+                ? { ...prev.treatmentStatus, remainingMs }
+                : undefined,
+            }));
+          },
         });
       } catch (error) {
         console.warn('Could not set up subscriptions:', error);
@@ -88,7 +98,7 @@ export const TreatmentScreen: React.FC = () => {
 
     return () => {
       if (unsubscribeBattery) unsubscribeBattery();
-      if (unsubscribeStatus) unsubscribeStatus();
+      if (unsubscribeTreatment) unsubscribeTreatment();
     };
   }, [deviceStatus.connected]);
 
@@ -217,6 +227,23 @@ export const TreatmentScreen: React.FC = () => {
       await clientRef.current.writeSteps(parsedSteps);
       await clientRef.current.writeTotalDurationMs(durationMs);
       await clientRef.current.writeIntensity(intensityValue);
+      await clientRef.current.writeLraEnables({lra1: 1, lra2: 1, lra3: 1});
+
+
+      // Read back treatment status to confirm
+      const treatmentStatus = await clientRef.current.readTreatment();
+
+      // Update state with treatment status
+      setDeviceStatus((prev) => ({
+        ...prev,
+        treatmentStatus: {
+          status: treatmentStatus.status,
+          errorCode: treatmentStatus.errorCode,
+          remainingMs: treatmentStatus.remainingMs,
+          intensityPct: treatmentStatus.intensityPct,
+          totalDurationMs: treatmentStatus.totalDurationMs,
+        },
+      }));
 
       Alert.alert('Success', 'Treatment sent to device');
     } catch (error) {
@@ -373,13 +400,13 @@ export const TreatmentScreen: React.FC = () => {
             <View style={styles.statusRow}>
               <Text style={styles.label}>Remaining Time:</Text>
               <Text style={styles.value}>
-                {(deviceStatus.treatmentStatus.remainingSec / 1000).toFixed(1)}s
+                {(deviceStatus.treatmentStatus.remainingMs / 1000).toFixed(1)}s
               </Text>
             </View>
             <View style={styles.statusRow}>
               <Text style={styles.label}>Total Duration:</Text>
               <Text style={styles.value}>
-                {(deviceStatus.treatmentStatus.totalDurationSec / 1000).toFixed(1)}s
+                {(deviceStatus.treatmentStatus.totalDurationMs / 1000).toFixed(1)}s
               </Text>
             </View>
             <View style={styles.statusRow}>
