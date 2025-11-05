@@ -24,35 +24,32 @@ interface DeviceStatus {
   treatmentStatus?: {
     status: 0 | 1 | 2 | 3;
     errorCode: number;
-    remainingMs: number;
+    remainingSec: number;       // UPDATED: seconds
     intensityPct: number;
-    totalDurationMs: number;
+    totalDurationSec: number;   // UPDATED: seconds
   };
 }
 
 interface StepInput {
   id: string;
-  amplitude: string;
-  duration: string;
+  amplitude: string;  // 0-100
+  duration: string;   // ms, multiple of 10
 }
 
 export const TreatmentScreen: React.FC = () => {
   const clientRef = useRef<BuddhaBleClient | null>(null);
-  const [deviceStatus, setDeviceStatus] = useState<DeviceStatus>({
-    connected: false,
-  });
+  const [deviceStatus, setDeviceStatus] = useState<DeviceStatus>({ connected: false });
   const [loading, setLoading] = useState(false);
-  const [steps, setSteps] = useState<StepInput[]>([
-    { id: '1', amplitude: '50', duration: '1000' },
-  ]);
+
+  // default 1 step
+  const [steps, setSteps] = useState<StepInput[]>([{ id: '1', amplitude: '50', duration: '1000' }]);
   const [intensity, setIntensity] = useState('100');
-  const [duration, setDuration] = useState('5000');
+  const [totalSeconds, setTotalSeconds] = useState('5');      // UPDATED: seconds (0–600)
+  const [pauseDurationMs, setPauseDurationMs] = useState('0'); // UPDATED: ms, multiple of 10
 
   // Initialize BLE client
   useEffect(() => {
-    if (!clientRef.current) {
-      clientRef.current = new BuddhaBleClient();
-    }
+    if (!clientRef.current) clientRef.current = new BuddhaBleClient();
 
     const client = clientRef.current;
     let unsubscribeBattery: (() => void) | null = null;
@@ -60,15 +57,11 @@ export const TreatmentScreen: React.FC = () => {
 
     const setupSubscriptions = async () => {
       try {
-        // Set up battery level subscription
         unsubscribeBattery = client.subscribeBatteryLevel((level: number) => {
-          setDeviceStatus((prev) => ({
-            ...prev,
-            batteryLevel: level,
-          }));
+          setDeviceStatus((prev) => ({ ...prev, batteryLevel: level }));
         });
 
-        // Set up treatment status subscription
+        // UPDATED: subscribe in seconds
         unsubscribeTreatment = client.subscribeTreatmentNotifies({
           onStatus: (status: 0 | 1 | 2 | 3) => {
             setDeviceStatus((prev) => ({
@@ -78,11 +71,11 @@ export const TreatmentScreen: React.FC = () => {
                 : undefined,
             }));
           },
-          onRemainingMs: (remainingMs: number) => {
+          onRemainingSec: (remainingSec: number) => {
             setDeviceStatus((prev) => ({
               ...prev,
               treatmentStatus: prev.treatmentStatus
-                ? { ...prev.treatmentStatus, remainingMs }
+                ? { ...prev.treatmentStatus, remainingSec }
                 : undefined,
             }));
           },
@@ -92,9 +85,7 @@ export const TreatmentScreen: React.FC = () => {
       }
     };
 
-    if (deviceStatus.connected) {
-      setupSubscriptions();
-    }
+    if (deviceStatus.connected) setupSubscriptions();
 
     return () => {
       if (unsubscribeBattery) unsubscribeBattery();
@@ -108,7 +99,6 @@ export const TreatmentScreen: React.FC = () => {
 
     const pollStatus = async () => {
       if (!clientRef.current || !deviceStatus.connected) return;
-
       try {
         const [battery, info] = await Promise.all([
           clientRef.current.readBattery(),
@@ -127,8 +117,8 @@ export const TreatmentScreen: React.FC = () => {
     };
 
     if (deviceStatus.connected) {
-      pollStatus(); // Initial read
-      pollInterval = setInterval(pollStatus, 2000); // Poll every 2 seconds
+      pollStatus();
+      pollInterval = setInterval(pollStatus, 2000);
     }
 
     return () => {
@@ -139,13 +129,7 @@ export const TreatmentScreen: React.FC = () => {
   const handleScanAndConnect = async () => {
     setLoading(true);
     try {
-      // Wait for Bluetooth to be ready and scan/connect
-      // (Permission checking is now done inside scanAndConnect)
-      //await clientRef.current!.waitForBluetoothPoweredOn(5000);
-
-      await clientRef.current!.scanAndConnect({
-        timeoutMs: 10000,
-      });
+      await clientRef.current!.scanAndConnect({ timeoutMs: 10000 });
       setDeviceStatus((prev) => ({ ...prev, connected: true }));
       Alert.alert('Success', 'Connected to device');
     } catch (error) {
@@ -166,6 +150,10 @@ export const TreatmentScreen: React.FC = () => {
   };
 
   const handleAddStep = () => {
+    if (steps.length >= 40) {
+      Alert.alert('Limit reached', 'Maximum of 40 steps per protocol.');
+      return;
+    }
     const newId = (Math.max(...steps.map((s) => parseInt(s.id, 10)), 0) + 1).toString();
     setSteps([...steps, { id: newId, amplitude: '50', duration: '1000' }]);
   };
@@ -179,12 +167,10 @@ export const TreatmentScreen: React.FC = () => {
   };
 
   const handleUpdateStep = (id: string, field: 'amplitude' | 'duration', value: string) => {
-    setSteps(
-      steps.map((s) =>
-        s.id === id ? { ...s, [field]: value } : s
-      )
-    );
+    setSteps(steps.map((s) => (s.id === id ? { ...s, [field]: value } : s)));
   };
+
+  const parseIntOrNaN = (v: string) => (v.trim() === '' ? NaN : parseInt(v, 10));
 
   const handleSendTreatment = async () => {
     try {
@@ -193,61 +179,69 @@ export const TreatmentScreen: React.FC = () => {
         return;
       }
 
-      // Validate inputs
-      const parsedSteps: Step[] = steps.map((s) => {
-        const amp = parseInt(s.amplitude, 10);
-        const dur = parseInt(s.duration, 10);
+      // Validate steps
+      const parsedSteps: Step[] = steps.map((s, idx) => {
+        const amp = parseIntOrNaN(s.amplitude);
+        const dur = parseIntOrNaN(s.duration);
 
-        if (isNaN(amp) || amp < 0 || amp > 100) {
-          throw new Error(`Invalid amplitude: ${s.amplitude}`);
+        if (!Number.isInteger(amp) || amp < 0 || amp > 100) {
+          throw new Error(`Step ${idx + 1}: amplitude must be 0–100`);
         }
-        if (isNaN(dur) || dur < 1 || dur > 65535) {
-          throw new Error(`Invalid duration: ${s.duration}`);
+        if (!Number.isInteger(dur) || dur < 0 || dur > 65530) {
+          throw new Error(`Step ${idx + 1}: duration must be 0–65530 ms`);
+        }
+        if (dur % 10 !== 0) {
+          throw new Error(`Step ${idx + 1}: duration must be a multiple of 10 ms`);
         }
 
-        return {
-          amplitudePct: amp,
-          durationMs: dur,
-        };
+        return { amplitudePct: amp, durationMs: dur };
       });
 
-      const intensityValue = parseInt(intensity, 10);
-      if (isNaN(intensityValue) || intensityValue < 0 || intensityValue > 100) {
-        throw new Error('Invalid intensity percentage');
+      // Validate pause
+      const pauseMs = parseIntOrNaN(pauseDurationMs);
+      if (!Number.isInteger(pauseMs) || pauseMs < 0 || pauseMs > 65530) {
+        throw new Error('Pause Duration must be 0–65530 ms');
+      }
+      if (pauseMs % 10 !== 0) {
+        throw new Error('Pause Duration must be a multiple of 10 ms');
       }
 
-      const durationMs = parseInt(duration, 10);
-      if (isNaN(durationMs) || durationMs < 1) {
-        throw new Error('Invalid total duration');
+      // Validate intensity
+      const intensityValue = parseIntOrNaN(intensity);
+      if (!Number.isInteger(intensityValue) || intensityValue < 0 || intensityValue > 100) {
+        throw new Error('Intensity must be 0–100%');
+      }
+
+      // Validate total seconds
+      const totalSec = parseIntOrNaN(totalSeconds);
+      if (!Number.isInteger(totalSec) || totalSec < 0 || totalSec > 600) {
+        throw new Error('Total Duration must be 0–600 seconds');
       }
 
       setLoading(true);
 
-      // Send treatment configuration
-      await clientRef.current.writeSteps(parsedSteps);
-      await clientRef.current.writeTotalDurationMs(durationMs);
+      // Send treatment configuration (122 bytes payload + total seconds + intensity)
+      await clientRef.current.writeStepList({ steps: parsedSteps, pauseDurationMs: pauseMs });
+      await clientRef.current.writeTotalDurationSec(totalSec);
       await clientRef.current.writeIntensity(intensityValue);
-      await clientRef.current.writeLraEnables({lra1: 1, lra2: 1, lra3: 1});
+      await clientRef.current.writeLraEnables({ lra1: 1, lra2: 1, lra3: 1 });
 
-
-      // Read back treatment status to confirm
-      const treatmentStatus = await clientRef.current.readTreatment();
-
-      // Update state with treatment status
+      // Read back treatment status
+      const t = await clientRef.current.readTreatment();
       setDeviceStatus((prev) => ({
         ...prev,
         treatmentStatus: {
-          status: treatmentStatus.status,
-          errorCode: treatmentStatus.errorCode,
-          remainingMs: treatmentStatus.remainingMs,
-          intensityPct: treatmentStatus.intensityPct,
-          totalDurationMs: treatmentStatus.totalDurationMs,
+          status: t.status,
+          errorCode: t.errorCode,
+          remainingSec: t.remainingSec,         // UPDATED
+          intensityPct: t.intensityPct,
+          totalDurationSec: t.totalDurationSec, // UPDATED
         },
       }));
 
       Alert.alert('Success', 'Treatment sent to device');
-    } catch (error) {
-      Alert.alert('Error', `Failed to send treatment: ${error}`);
+    } catch (error: any) {
+      Alert.alert('Error', `Failed to send treatment: ${error?.message ?? error}`);
     } finally {
       setLoading(false);
     }
@@ -259,7 +253,6 @@ export const TreatmentScreen: React.FC = () => {
         Alert.alert('Error', 'Not connected to device');
         return;
       }
-
       setLoading(true);
       await clientRef.current.writeControl(1); // 1 = start
       Alert.alert('Success', 'Treatment started');
@@ -276,7 +269,6 @@ export const TreatmentScreen: React.FC = () => {
         Alert.alert('Error', 'Not connected to device');
         return;
       }
-
       setLoading(true);
       await clientRef.current.writeControl(0); // 0 = stop
       Alert.alert('Success', 'Treatment stopped');
@@ -289,16 +281,11 @@ export const TreatmentScreen: React.FC = () => {
 
   const getStatusText = (status?: number): string => {
     switch (status) {
-      case 0:
-        return 'Stopped';
-      case 1:
-        return 'Running';
-      case 2:
-        return 'Paused';
-      case 3:
-        return 'Error';
-      default:
-        return 'Unknown';
+      case 0: return 'Stopped';
+      case 1: return 'Running';
+      case 2: return 'Paused';
+      case 3: return 'Error';
+      default: return 'Unknown';
     }
   };
 
@@ -360,9 +347,7 @@ export const TreatmentScreen: React.FC = () => {
             onPress={handleScanAndConnect}
             disabled={deviceStatus.connected || loading}
           >
-            {loading ? (
-              <ActivityIndicator color="#fff" />
-            ) : (
+            {loading ? <ActivityIndicator color="#fff" /> : (
               <Text style={styles.buttonText}>
                 {deviceStatus.connected ? 'Connected' : 'Connect'}
               </Text>
@@ -389,9 +374,7 @@ export const TreatmentScreen: React.FC = () => {
               <Text
                 style={[
                   styles.value,
-                  deviceStatus.treatmentStatus.status === 1
-                    ? styles.statusRunning
-                    : styles.statusNotRunning,
+                  deviceStatus.treatmentStatus.status === 1 ? styles.statusRunning : styles.statusNotRunning,
                 ]}
               >
                 {getStatusText(deviceStatus.treatmentStatus.status)}
@@ -399,15 +382,11 @@ export const TreatmentScreen: React.FC = () => {
             </View>
             <View style={styles.statusRow}>
               <Text style={styles.label}>Remaining Time:</Text>
-              <Text style={styles.value}>
-                {(deviceStatus.treatmentStatus.remainingMs / 1000).toFixed(1)}s
-              </Text>
+              <Text style={styles.value}>{deviceStatus.treatmentStatus.remainingSec}s</Text>
             </View>
             <View style={styles.statusRow}>
               <Text style={styles.label}>Total Duration:</Text>
-              <Text style={styles.value}>
-                {(deviceStatus.treatmentStatus.totalDurationMs / 1000).toFixed(1)}s
-              </Text>
+              <Text style={styles.value}>{deviceStatus.treatmentStatus.totalDurationSec}s</Text>
             </View>
             <View style={styles.statusRow}>
               <Text style={styles.label}>Intensity:</Text>
@@ -447,16 +426,17 @@ export const TreatmentScreen: React.FC = () => {
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Treatment Configuration</Text>
 
-        {/* Total Duration */}
+        {/* Total Duration (seconds) */}
         <View style={styles.inputGroup}>
-          <Text style={styles.label}>Total Duration (ms)</Text>
+          <Text style={styles.label}>Total Duration (seconds, 0–600)</Text>
           <TextInput
             style={styles.input}
-            value={duration}
-            onChangeText={setDuration}
-            placeholder="5000"
+            value={totalSeconds}
+            onChangeText={setTotalSeconds}
+            placeholder="5"
             keyboardType="number-pad"
             editable={!loading}
+            maxLength={3}
           />
         </View>
 
@@ -474,14 +454,27 @@ export const TreatmentScreen: React.FC = () => {
           />
         </View>
 
+        {/* Pause Duration */}
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Pause Duration (ms, multiple of 10)</Text>
+          <TextInput
+            style={styles.input}
+            value={pauseDurationMs}
+            onChangeText={setPauseDurationMs}
+            placeholder="0"
+            keyboardType="number-pad"
+            editable={!loading}
+          />
+        </View>
+
         {/* Steps */}
         <View style={styles.stepsContainer}>
           <View style={styles.stepsHeader}>
-            <Text style={styles.label}>Treatment Steps</Text>
+            <Text style={styles.label}>Treatment Steps (max 40)</Text>
             <TouchableOpacity
-              style={styles.addStepButton}
+              style={[styles.addStepButton, steps.length >= 40 && { opacity: 0.6 }]}
               onPress={handleAddStep}
-              disabled={loading}
+              disabled={loading || steps.length >= 40}
             >
               <Text style={styles.addStepButtonText}>+ Add Step</Text>
             </TouchableOpacity>
@@ -497,10 +490,8 @@ export const TreatmentScreen: React.FC = () => {
                   <TextInput
                     style={styles.input}
                     value={step.amplitude}
-                    onChangeText={(value) =>
-                      handleUpdateStep(step.id, 'amplitude', value)
-                    }
-                    placeholder="0-100"
+                    onChangeText={(value) => handleUpdateStep(step.id, 'amplitude', value)}
+                    placeholder="0–100"
                     keyboardType="number-pad"
                     maxLength={3}
                     editable={!loading}
@@ -508,12 +499,12 @@ export const TreatmentScreen: React.FC = () => {
                 </View>
 
                 <View style={[styles.inputGroup, styles.stepInput]}>
-                  <Text style={styles.label}>Duration (ms)</Text>
+                  <Text style={styles.label}>Duration (ms, ×10)</Text>
                   <TextInput
                     style={styles.input}
                     value={step.duration}
                     onChangeText={(value) => handleUpdateStep(step.id, 'duration', value)}
-                    placeholder="1-65535"
+                    placeholder="e.g. 1000"
                     keyboardType="number-pad"
                     editable={!loading}
                   />
@@ -539,11 +530,7 @@ export const TreatmentScreen: React.FC = () => {
           onPress={handleSendTreatment}
           disabled={!deviceStatus.connected || loading}
         >
-          {loading ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={styles.buttonText}>Send Treatment</Text>
-          )}
+          {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Send Treatment</Text>}
         </TouchableOpacity>
       </View>
     </ScrollView>
@@ -551,165 +538,40 @@ export const TreatmentScreen: React.FC = () => {
 };
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f5f5f5',
-  },
+  container: { flex: 1, backgroundColor: '#f5f5f5' },
   section: {
-    margin: 12,
-    padding: 16,
-    backgroundColor: '#fff',
-    borderRadius: 8,
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.2,
-    shadowRadius: 1.41,
+    margin: 12, padding: 16, backgroundColor: '#fff', borderRadius: 8,
+    elevation: 2, shadowColor: '#000', shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2, shadowRadius: 1.41,
   },
-  sectionTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    marginBottom: 12,
-    color: '#333',
-  },
-  statusBox: {
-    backgroundColor: '#f9f9f9',
-    borderRadius: 6,
-    padding: 12,
-    marginBottom: 12,
-  },
-  statusRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
-  },
-  label: {
-    fontSize: 14,
-    color: '#666',
-    fontWeight: '500',
-  },
-  value: {
-    fontSize: 14,
-    color: '#333',
-    fontWeight: '600',
-  },
-  buttonRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  button: {
-    flex: 1,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 6,
-    alignItems: 'center',
-    justifyContent: 'center',
-    minHeight: 44,
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  connectButton: {
-    backgroundColor: '#4CAF50',
-  },
-  disconnectButton: {
-    backgroundColor: '#FF6B6B',
-  },
-  startButton: {
-    backgroundColor: '#4CAF50',
-  },
-  stopButton: {
-    backgroundColor: '#FF6B6B',
-  },
-  sendButton: {
-    backgroundColor: '#2196F3',
-    marginTop: 12,
-  },
-  inputGroup: {
-    marginBottom: 12,
-  },
-  input: {
-    borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 6,
-    padding: 10,
-    marginTop: 4,
-    fontSize: 14,
-    color: '#333',
-  },
-  stepsContainer: {
-    marginTop: 12,
-    marginBottom: 16,
-  },
-  stepsHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  addStepButton: {
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    backgroundColor: '#2196F3',
-    borderRadius: 4,
-  },
-  addStepButtonText: {
-    color: '#fff',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  stepCard: {
-    backgroundColor: '#f9f9f9',
-    borderLeftWidth: 4,
-    borderLeftColor: '#2196F3',
-    padding: 12,
-    marginBottom: 8,
-    borderRadius: 4,
-  },
-  stepNumber: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#666',
-    marginBottom: 10,
-  },
-  stepInputRow: {
-    flexDirection: 'row',
-    gap: 8,
-    alignItems: 'flex-end',
-  },
-  stepInput: {
-    flex: 1,
-    marginBottom: 0,
-  },
-  removeStepButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    backgroundColor: '#FFE5E5',
-    borderRadius: 4,
-    justifyContent: 'center',
-  },
-  removeStepButtonText: {
-    color: '#FF6B6B',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  statusConnected: {
-    color: '#4CAF50',
-  },
-  statusDisconnected: {
-    color: '#FF6B6B',
-  },
-  statusRunning: {
-    color: '#4CAF50',
-  },
-  statusNotRunning: {
-    color: '#FFA500',
-  },
-  errorText: {
-    color: '#FF6B6B',
-  },
+  sectionTitle: { fontSize: 18, fontWeight: '600', marginBottom: 12, color: '#333' },
+  statusBox: { backgroundColor: '#f9f9f9', borderRadius: 6, padding: 12, marginBottom: 12 },
+  statusRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#eee' },
+  label: { fontSize: 14, color: '#666', fontWeight: '500' },
+  value: { fontSize: 14, color: '#333', fontWeight: '600' },
+  buttonRow: { flexDirection: 'row', gap: 8 },
+  button: { flex: 1, paddingVertical: 12, paddingHorizontal: 16, borderRadius: 6, alignItems: 'center', justifyContent: 'center', minHeight: 44 },
+  buttonText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  connectButton: { backgroundColor: '#4CAF50' },
+  disconnectButton: { backgroundColor: '#FF6B6B' },
+  startButton: { backgroundColor: '#4CAF50' },
+  stopButton: { backgroundColor: '#FF6B6B' },
+  sendButton: { backgroundColor: '#2196F3', marginTop: 12 },
+  inputGroup: { marginBottom: 12 },
+  input: { borderWidth: 1, borderColor: '#ddd', borderRadius: 6, padding: 10, marginTop: 4, fontSize: 14, color: '#333' },
+  stepsContainer: { marginTop: 12, marginBottom: 16 },
+  stepsHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  addStepButton: { paddingVertical: 6, paddingHorizontal: 12, backgroundColor: '#2196F3', borderRadius: 4 },
+  addStepButtonText: { color: '#fff', fontSize: 12, fontWeight: '600' },
+  stepCard: { backgroundColor: '#f9f9f9', borderLeftWidth: 4, borderLeftColor: '#2196F3', padding: 12, marginBottom: 8, borderRadius: 4 },
+  stepNumber: { fontSize: 13, fontWeight: '600', color: '#666', marginBottom: 10 },
+  stepInputRow: { flexDirection: 'row', gap: 8, alignItems: 'flex-end' },
+  stepInput: { flex: 1, marginBottom: 0 },
+  removeStepButton: { paddingVertical: 8, paddingHorizontal: 10, backgroundColor: '#FFE5E5', borderRadius: 4, justifyContent: 'center' },
+  removeStepButtonText: { color: '#FF6B6B', fontSize: 12, fontWeight: '600' },
+  statusConnected: { color: '#4CAF50' },
+  statusDisconnected: { color: '#FF6B6B' },
+  statusRunning: { color: '#4CAF50' },
+  statusNotRunning: { color: '#FFA500' },
+  errorText: { color: '#FF6B6B' },
 });

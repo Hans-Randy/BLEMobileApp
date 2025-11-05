@@ -1,6 +1,6 @@
 import { BleManager, Device, Characteristic } from 'react-native-ble-plx';
 import { Platform } from 'react-native';
-import { request, PERMISSIONS, RESULTS, check, requestMultiple, checkMultiple } from 'react-native-permissions';
+import { PERMISSIONS, RESULTS, requestMultiple, checkMultiple } from 'react-native-permissions';
 import { Buffer } from 'buffer';
 
 // ---- UUIDs (BUDDHA Rev F) -------------------------------------------
@@ -26,11 +26,11 @@ const C_STEP_LIST = '01950031-d6ea-7cc9-9d0b-ab7df1248728'; //Array[40]
 
 // Treatment Control Characteristics
 const C_CTRL = '01950041-d6ea-7cc9-9d0b-ab7df1248728'; // uint8_t, R/W
-const C_TOTAL_MS = '01950042-d6ea-7cc9-9d0b-ab7df1248728'; // uint16_t, R/W  (milliseconds)
+const C_TOTAL_SEC = '01950042-d6ea-7cc9-9d0b-ab7df1248728'; // uint16_t, R/W  (milliseconds)
 const C_LRA1_EN = '01950043-d6ea-7cc9-9d0b-ab7df1248728'; // uint8_t, R/W
 const C_LRA2_EN = '01950044-d6ea-7cc9-9d0b-ab7df1248728'; // uint8_t, R/W
 const C_LRA3_EN = '01950045-d6ea-7cc9-9d0b-ab7df1248728'; // uint8_t, R/W
-const C_REMAIN_MS = '01950046-d6ea-7cc9-9d0b-ab7df1248728'; // uint16_t, R/Notify (milliseconds)
+const C_REMAIN_SEC = '01950046-d6ea-7cc9-9d0b-ab7df1248728'; // uint16_t, R/Notify (milliseconds)
 const C_INTENSITY = '01950047-d6ea-7cc9-9d0b-ab7df1248728'; // uint8_t, R/W (%)
 const C_STATUS = '01950048-d6ea-7cc9-9d0b-ab7df1248728'; // uint8_t, R/Notify
 const C_ERROR = '01950049-d6ea-7cc9-9d0b-ab7df1248728'; // uint16_t, Read
@@ -74,42 +74,57 @@ const writeU16 = (v: number) => {
   return b64FromBytes([byte0, byte1]);
 };
 
-// ---- Step list payload: 3 bytes per step: [amp:u8][dur_lo:u8][dur_hi:u8] ----
-const packStepsToB64 = (steps: Step[]): string => {
-  if (!Array.isArray(steps) || steps.length === 0) throw new Error('steps required');
+// ---- Step list payload ----
+const packStepListToB64 = ({ steps, pauseDurationMs }: StepListConfig): string => {
+  if (!Array.isArray(steps)) throw new Error('steps required (array)');
+  if (steps.length > 40) throw new Error('max 40 steps');
+  if (!Number.isInteger(pauseDurationMs) || pauseDurationMs < 0 || pauseDurationMs > 65530)
+    throw new Error('pauseDurationMs must be 0–65530');
+  assert10msMultiple(pauseDurationMs);
+
   const bytes: number[] = [];
-  for (const s of steps) {
-    if (!Number.isInteger(s.amplitudePct) || s.amplitudePct < 0 || s.amplitudePct > 100) {
-      throw new Error('amplitudePct must be 0–100');
-    }
-    if (!Number.isInteger(s.durationMs) || s.durationMs < 1 || s.durationMs > 0xFFFF) {
-      throw new Error('durationMs must be 1–65535 ms');
-    }
-    // [amp][dur_lo][dur_hi]
-    bytes.push(
-      // eslint-disable-next-line no-bitwise
-      s.amplitudePct & 0xFF,
-      // eslint-disable-next-line no-bitwise
-      s.durationMs & 0xFF,
-      // eslint-disable-next-line no-bitwise
-      (s.durationMs >> 8) & 0xFF
-    );
+
+  // emit up to 40 steps, pad rest with zeros
+  for (let i = 0; i < 40; i++) {
+    const s = steps[i];
+    const amp = s ? s.amplitudePct : 0;
+    const dur = s ? s.durationMs : 0;
+
+    if (!Number.isInteger(amp) || amp < 0 || amp > 100) throw new Error('amplitudePct must be 0–100');
+    if (!Number.isInteger(dur) || dur < 0 || dur > 65530) throw new Error('durationMs must be 0–65530');
+    assert10msMultiple(dur);
+
+    bytes.push(amp, ...toU16LE(dur));
   }
+
+  // append pause duration
+  bytes.push(...toU16LE(pauseDurationMs));
+
+  // enforce exact 122 bytes
+  if (bytes.length !== 122) throw new Error(`internal error: got ${bytes.length} bytes, expected 122`);
+
   return b64FromBytes(bytes);
 };
 
-const unpackStepsFromB64 = (b64: string | null | undefined): Step[] => {
-  if (!b64) return [];
+const unpackStepListFromB64 = (b64: string | null | undefined): StepListConfig => {
+  if (!b64) return { steps: [], pauseDurationMs: 0 };
   const d = bytesFromB64(b64);
-  if (d.length % 3 !== 0) throw new Error('Malformed step list payload (not multiple of 3)');
+  if (d.length !== 122) throw new Error(`Malformed step list payload (expected 122 bytes, got ${d.length})`);
+
   const steps: Step[] = [];
-  for (let i = 0; i < d.length; i += 3) {
+  for (let i = 0; i < 120; i += 3) {
     const amplitudePct = d[i];
-    // eslint-disable-next-line no-bitwise
     const durationMs = d[i + 1] | (d[i + 2] << 8);
     steps.push({ amplitudePct, durationMs });
   }
-  return steps;
+  const pauseDurationMs = d[120] | (d[121] << 8);
+
+  // Optionally trim trailing zero-steps for convenience:
+  while (steps.length && steps[steps.length - 1].amplitudePct === 0 && steps[steps.length - 1].durationMs === 0) {
+    steps.pop();
+  }
+
+  return { steps, pauseDurationMs };
 };
 
 export class BuddhaBleClient {
@@ -237,6 +252,10 @@ export class BuddhaBleClient {
             this.manager.stopDeviceScan();
             const d = await device.connect();
             this.device = await d.discoverAllServicesAndCharacteristics();
+            // Spec: MTU 147 to carry 122-byte step list comfortably
+            if (Platform.OS === 'android') {
+              await this?.device?.requestMTU(147);
+            }
             clearTimeout(timer);
             resolve();
           } catch (e) {
@@ -323,25 +342,26 @@ export class BuddhaBleClient {
     await dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_CTRL, writeU8(action));
   }
 
-  async writeTotalDurationMs(ms: number) {
+  async writeTotalDurationSec(seconds: number) {
+    if (!Number.isInteger(seconds) || seconds < 0 || seconds > 600) throw new Error('total duration 0–600 s');
     const dev = this.requireDev();
-    await dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_TOTAL_MS, writeU16(ms));
-  }
+    await dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_TOTAL_SEC, writeU16(seconds));
+ }
 
   async writeIntensity(percent: number) {
     const dev = this.requireDev();
     await dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_INTENSITY, writeU8(percent));
   }
 
-  async writeDurationMsAndIntensity(ms: number, pct: number) {
-    if (!Number.isInteger(ms) || ms < 0 || ms > 0xFFFF) throw new Error('ms 0–65535');
-    if (!Number.isInteger(pct) || pct < 0 || pct > 100) throw new Error('intensity 0–100');
-    const dev = this.requireDev();
-    await Promise.all([
-        dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_TOTAL_MS, writeU16(ms)),
-        dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_INTENSITY, writeU8(pct)),
-    ]);
-  }
+ async writeDurationAndIntensity(seconds: number, pct: number) {
+  if (!Number.isInteger(seconds) || seconds < 0 || seconds > 600) throw new Error('seconds 0–600');
+  if (!Number.isInteger(pct) || pct < 0 || pct > 100) throw new Error('intensity 0–100');
+  const dev = this.requireDev();
+  await Promise.all([
+    dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_TOTAL_SEC, writeU16(seconds)),
+    dev.writeCharacteristicWithoutResponseForService(S_TCTRL, C_INTENSITY, writeU8(pct)),
+  ]);
+ }
   
   async writeLraEnables(flags: Partial<{ lra1: 0|1; lra2: 0|1; lra3: 0|1 }>) {
     const dev = this.requireDev();
@@ -353,13 +373,15 @@ export class BuddhaBleClient {
     if (ops.length) await Promise.all(ops);
   }
 
-  async writeSteps(steps: Step[]) {
-    const dev = this.requireDev();
-    console.log('Writing steps:', steps);
-    const payload = packStepsToB64(steps);
-    console.log('Steps payload:', payload);
-    await dev.writeCharacteristicWithoutResponseForService(S_TCFG, C_STEP_LIST, payload);
-  }
+async writeStepList(cfg: StepListConfig) {
+  const dev = this.requireDev();
+  const payload = packStepListToB64(cfg);
+  await dev.writeCharacteristicWithoutResponseForService(S_TCFG, C_STEP_LIST, payload);
+}
+
+async writeSteps(steps: Step[], pauseDurationMs = 0) {
+  return this.writeStepList({ steps, pauseDurationMs });
+}
 
   subscribeStatus(cb: (status: 0 | 1 | 2 | 3) => void) {
     const dev = this.requireDev();
@@ -368,35 +390,35 @@ export class BuddhaBleClient {
     }).remove;
   }
 
-  subscribeRemainingTime(cb: (remainingMillisecs: number) => void) {
-    const dev = this.requireDev();
-    return dev.monitorCharacteristicForService(S_TCTRL, C_REMAIN_MS, (err: any, c: any) => {
-      if (!err && c?.value) cb(readU16(c));
-    }).remove;
-  }
+subscribeRemainingTime(cb: (remainingSeconds: number) => void) {
+  const dev = this.requireDev();
+  return dev.monitorCharacteristicForService(S_TCTRL, C_REMAIN_SEC, (err: any, c: any) => {
+    if (!err && c?.value) cb(readU16(c));
+  }).remove;
+}
 
   subscribeTreatmentNotifies(cb: {
   onStatus?: (s: 0|1|2|3) => void,
-  onRemainingMs?: (ms: number) => void,
+  onRemainingSec?: (sec: number) => void,
 }) {
   const dev = this.requireDev();
   const subs = [
     dev.monitorCharacteristicForService(S_TCTRL, C_STATUS, (err, c) => {
       if (!err && c?.value && cb.onStatus) cb.onStatus(readU8(c) as 0|1|2|3);
     }),
-    dev.monitorCharacteristicForService(S_TCTRL, C_REMAIN_MS, (err, c) => {
-      if (!err && c?.value && cb.onRemainingMs) cb.onRemainingMs(readU16(c));
+    dev.monitorCharacteristicForService(S_TCTRL, C_REMAIN_SEC, (err, c) => {
+      if (!err && c?.value && cb.onRemainingSec) cb.onRemainingSec(readU16(c));
     }),
   ];
   return () => subs.forEach(s => s.remove());
 }
 
 
-  async readRemainingTimeMs(): Promise<number> {
-    const dev = this.requireDev();
-    const ch = await dev.readCharacteristicForService(S_TCTRL, C_REMAIN_MS);
-    return readU16(ch); // ms (u16)
-  }
+ async readRemainingTimeSec(): Promise<number> {
+  const dev = this.requireDev();
+  const ch = await dev.readCharacteristicForService(S_TCTRL, C_REMAIN_SEC);
+  return readU16(ch); // seconds
+ }
 
   async readLraEnables() {
     const dev = this.requireDev();
@@ -412,44 +434,52 @@ export class BuddhaBleClient {
     };
   }
 
-  async readSteps() {
-    const dev = this.requireDev();
-    const ch = await dev.readCharacteristicForService(S_TCFG, C_STEP_LIST);
-    const steps = unpackStepsFromB64(ch.value);
-    return { steps };
-  }
+  async readStepList(): Promise<StepListConfig> {
+  const dev = this.requireDev();
+  const ch = await dev.readCharacteristicForService(S_TCFG, C_STEP_LIST);
+  return unpackStepListFromB64(ch.value);
+}
     
-  async readTreatment() {
-    const dev = this.requireDev();
-    const [ctrlC, totalC, remC, intenC, statusC, errC, lra1C, lra2C, lra3C, stepsC] = await Promise.all([
-        dev.readCharacteristicForService(S_TCTRL, C_CTRL),
-        dev.readCharacteristicForService(S_TCTRL, C_TOTAL_MS),
-        dev.readCharacteristicForService(S_TCTRL, C_REMAIN_MS),
-        dev.readCharacteristicForService(S_TCTRL, C_INTENSITY),
-        dev.readCharacteristicForService(S_TCTRL, C_STATUS),
-        dev.readCharacteristicForService(S_TCTRL, C_ERROR),
-        dev.readCharacteristicForService(S_TCTRL, C_LRA1_EN),
-        dev.readCharacteristicForService(S_TCTRL, C_LRA2_EN),
-        dev.readCharacteristicForService(S_TCTRL, C_LRA3_EN),
-        dev.readCharacteristicForService(S_TCFG, C_STEP_LIST)
-    ]);
+async readTreatment() {
+  const dev = this.requireDev();
+  const [ctrlC, totalC, remC, intenC, statusC, errC, lra1C, lra2C, lra3C, stepsC] = await Promise.all([
+    dev.readCharacteristicForService(S_TCTRL, C_CTRL),
+    dev.readCharacteristicForService(S_TCTRL, C_TOTAL_SEC),
+    dev.readCharacteristicForService(S_TCTRL, C_REMAIN_SEC),
+    dev.readCharacteristicForService(S_TCTRL, C_INTENSITY),
+    dev.readCharacteristicForService(S_TCTRL, C_STATUS),
+    dev.readCharacteristicForService(S_TCTRL, C_ERROR),
+    dev.readCharacteristicForService(S_TCTRL, C_LRA1_EN),
+    dev.readCharacteristicForService(S_TCTRL, C_LRA2_EN),
+    dev.readCharacteristicForService(S_TCTRL, C_LRA3_EN),
+    dev.readCharacteristicForService(S_TCFG, C_STEP_LIST),
+  ]);
 
-    return {
-        control: readU8(ctrlC),
-        totalDurationMs: readU16(totalC),
-        remainingMs: readU16(remC),
-        intensityPct: readU8(intenC),
-        status: readU8(statusC) as 0|1|2|3,
-        errorCode: readU16(errC),
-        lra1: readU8(lra1C) as 0 | 1,
-        lra2: readU8(lra2C) as 0 | 1,
-        lra3: readU8(lra3C) as 0 | 1,
-        steps: unpackStepsFromB64(stepsC.value),
-    };
- }
+  return {
+    control: readU8(ctrlC),                           // 0-Stop, 1-Run, 2-Pause
+    totalDurationSec: readU16(totalC),                // seconds (0–600)
+    remainingSec: readU16(remC),                      // seconds (0–600)
+    intensityPct: readU8(intenC),                     // 0–100
+    status: readU8(statusC) as 0|1|2|3,               // 0 Idle, 1 Charging, 2 Active, 3 Error
+    errorCode: readU16(errC),                         // 0x0000–0xFFFF
+    lra1: readU8(lra1C) as 0 | 1,
+    lra2: readU8(lra2C) as 0 | 1,
+    lra3: readU8(lra3C) as 0 | 1,
+    stepList: unpackStepListFromB64(stepsC.value),    // { steps, pauseDurationMs }
+  };
+}
 }
 
-export type Step = {
-  amplitudePct: number; // 0–100 (u8)
-  durationMs: number; // 1–65535 ms (u16)
+
+const toU16LE = (v: number) => [v & 0xff, (v >> 8) & 0xff];
+
+const assert10msMultiple = (ms: number) => {
+  if (ms % 10 !== 0) throw new Error('duration must be a multiple of 10 ms');
+};
+
+export type Step = { amplitudePct: number; durationMs: number }; // duration must be multiple of 10ms
+
+export type StepListConfig = {
+  steps: Step[];          // up to 40; remainder padded with zeros
+  pauseDurationMs: number; // 0–65530 ms, multiple of 10 ms
 };
